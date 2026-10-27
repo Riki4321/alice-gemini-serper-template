@@ -2,8 +2,8 @@ const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
+const TOTAL_RESPONSE_BUDGET_MS = 4000;
+const SERPER_TIMEOUT_MS = 1800;
 const GEMINI_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
@@ -46,7 +46,7 @@ function fitAliceText(value) {
 }
 
 function isSearchIntent(text) {
-  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные/i.test(text);
+  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up|score|schedule|stock|rate|who won)\b|сегодня|сейчас|последн|новост|погод|курс|найди|поищи|актуальн|сколько стоит|сколько сейчас|свежие данные|кто выиграл|кто победил|результат|расписание|когда выйдет|когда начн|цена|стоит сейчас/i.test(text);
 }
 
 function safeHistory(history) {
@@ -190,6 +190,16 @@ function errorForUser(error) {
   }
 }
 
+// Emits one structured line per request so Vercel Logs can show where the time went.
+// No question text or secrets are logged — only lengths, durations and the outcome.
+function logMetric(fields) {
+  try {
+    console.log(JSON.stringify({ metric: "alice_request", ...fields }));
+  } catch {
+    // Never let logging break a response.
+  }
+}
+
 export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
@@ -218,19 +228,38 @@ export default async function handler(req, res) {
     ));
   }
 
+  let searchMs = 0;
+  let geminiMs = 0;
+  let searchAttempted = false;
+
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+      // Alice expects a response within ~4.5 s, so reserve the remaining budget for
+      // Gemini and give search whatever is left, capped by SERPER_TIMEOUT_MS.
+      searchAttempted = true;
+      const searchStartedAt = Date.now();
+      try {
+        searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2000)));
+      } finally {
+        // Record elapsed time even if the step throws, so metrics stay accurate.
+        searchMs = Date.now() - searchStartedAt;
+      }
     }
 
-    const answer = await askGemini(
-      text,
-      oldHistory,
-      searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
-    );
+    const geminiStartedAt = Date.now();
+    let answer;
+    try {
+      answer = await askGemini(
+        text,
+        oldHistory,
+        searchContext,
+        Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 500))
+      );
+    } finally {
+      // Record elapsed time even if the step throws (e.g. on a timeout abort).
+      geminiMs = Date.now() - geminiStartedAt;
+    }
 
     const history = [
       ...oldHistory,
@@ -238,10 +267,33 @@ export default async function handler(req, res) {
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
+    logMetric({
+      outcome: "ok",
+      totalMs: Date.now() - startedAt,
+      searchAttempted,
+      searchUsed: Boolean(searchContext),
+      searchMs,
+      geminiMs,
+      textLen: text.length
+    });
+
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    // AbortController rejects with an error whose name is "AbortError"; its message
+    // varies between Node versions (e.g. "This operation was aborted"), so match on name.
+    const safeError = error?.name === "AbortError" ? new Error("TIME_BUDGET_EXHAUSTED") : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
+
+    logMetric({
+      outcome: "fallback",
+      reason: safeError?.message || "unknown",
+      totalMs: Date.now() - startedAt,
+      searchAttempted,
+      searchMs,
+      geminiMs,
+      textLen: text.length
+    });
+
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
 }
